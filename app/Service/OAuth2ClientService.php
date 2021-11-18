@@ -13,10 +13,10 @@ use Session;
  */
 class OAuth2ClientService
 {
-    const URL_AUTHORIZE = '%s/oauth/authorize?%s';
-    const URL_LOGOUT    = '%s/oauth/logout?%s';
-    const URL_TOKEN     = '%s/oauth/token';
-    const URL_USER_INFO = '%s/api/user';
+    const URL_AUTHORIZE = '%s://%s/oauth/authorize?%s';
+    const URL_LOGOUT    = '%s://%s/oauth/logout?%s';
+    const URL_TOKEN     = '%s://%s/oauth/token';
+    const URL_USER_INFO = '%s://%s/api/user';
     const PASSPORT_SESSION_STATE = '_passport_state';
     const PASSPORT_SESSION_CODE_VERIFIER = '_passport_code_verifier';
 
@@ -27,24 +27,15 @@ class OAuth2ClientService
      * @return String
      */
     public static function redirectToLoginProvider():String {
-        $state       = Str::random(256);
-        $codeVerifier = Str::random(128);
-
-        $codeChallenge = strtr(rtrim(
-            base64_encode(hash('sha256', $codeVerifier, true))
-            , '='), '+/', '-_');
-
-        Session::put(self::PASSPORT_SESSION_STATE, $state);
-        Session::put(self::PASSPORT_SESSION_CODE_VERIFIER, $codeVerifier);
-
-        return sprintf(static::getHttpProcol() . self::URL_AUTHORIZE,
+        return sprintf(self::URL_AUTHORIZE,
+            static::getHttpProcol(),
             ENV('PASSPORT_HOST'),
             http_build_query([
                 'client_id' => ENV('PASSPORT_CLIENT_ID'),
                 'redirect_url' => ENV('PASSPORT_REDIRECT_URL'),
                 'response_type' => 'code',
-                'state' => $state,
-                'code_challenge' => $codeChallenge,
+                'state' => self::codeState(),
+                'code_challenge' => self::codeChallenge(),
                 'code_challenge_method' => 'S256',
             ])
         );
@@ -57,7 +48,8 @@ class OAuth2ClientService
      * @return String
      */
     public static function redirectToLogoutProvider():String {
-        return sprintf(static::getHttpProcol() . self::URL_LOGOUT,
+        return sprintf(self::URL_LOGOUT,
+            static::getHttpProcol(),
             ENV('PASSPORT_HOST'),
             http_build_query([
                 'client_id' => ENV('PASSPORT_CLIENT_ID'),
@@ -88,7 +80,9 @@ class OAuth2ClientService
             if(empty($state) OR empty($stateSession) OR $state != $stateSession)
                 throw new \Exception('Não foi possível validar o estado.');
 
-            $tokenUrl = sprintf(static::getHttpProcol() . self::URL_TOKEN, ENV('PASSPORT_HOST'));
+            $tokenUrl = sprintf(self::URL_TOKEN,
+                static::getHttpProcol(),
+                ENV('PASSPORT_HOST'));
 
             try {
                 $response = Http::post($tokenUrl, [
@@ -137,7 +131,9 @@ class OAuth2ClientService
             if(empty($accessToken))
                 throw new \Exception('Token de acesso não informado.');
 
-            $getUserInfoUrl = sprintf(static::getHttpProcol() . self::URL_USER_INFO, ENV('PASSPORT_HOST'));
+            $getUserInfoUrl = sprintf(self::URL_USER_INFO,
+                static::getHttpProcol(),
+                ENV('PASSPORT_HOST'));
 
             try {
                 $response = Http::withHeaders([
@@ -166,6 +162,34 @@ class OAuth2ClientService
      * @return String
      */
     protected static function getHttpProcol():String {
-        return ENV('APP_ENV') != 'production' ? 'http://' : 'https://';
+        return ENV('APP_ENV') != 'production' ? 'http' : 'https';
+    }
+
+    /**
+     * codeChallenge
+     * @return String
+     */
+    protected static function codeChallenge():String {
+        $codeVerifier = Str::random(128);
+
+        $codeChallenge = strtr(rtrim(
+            base64_encode(hash('sha256', $codeVerifier, true))
+            , '='), '+/', '-_');
+
+        Session::put(self::PASSPORT_SESSION_STATE, $codeVerifier);
+
+        return $codeChallenge;
+    }
+
+    /**
+     * codeState
+     * @return String
+     */
+    protected static function codeState():String {
+        $state = Str::random(256);
+
+        Session::put(self::PASSPORT_SESSION_STATE, $state);
+
+        return $state;
     }
 }
