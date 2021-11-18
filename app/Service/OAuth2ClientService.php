@@ -1,10 +1,10 @@
 <?php
 
-
 namespace App\Services;
 
 use App\Http\Requests\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 use Session;
 
 /**
@@ -17,6 +17,8 @@ class OAuth2ClientService
     const URL_LOGOUT    = '%s/oauth/logout?%s';
     const URL_TOKEN     = '%s/oauth/token';
     const URL_USER_INFO = '%s/api/user';
+    const PASSPORT_SESSION_STATE = '_passport_state';
+    const PASSPORT_SESSION_CODE_VERIFIER = '_passport_code_verifier';
 
     /**
      * redirectToLoginProvider
@@ -24,8 +26,16 @@ class OAuth2ClientService
      *
      * @return String
      */
-    public static function getLoginUrl():String {
-        $state = \Illuminate\Support\Str::random(256);
+    public static function redirectToLoginProvider():String {
+        $state       = Str::random(256);
+        $codeVerifier = Str::random(128);
+
+        $codeChallenge = strtr(rtrim(
+            base64_encode(hash('sha256', $codeVerifier, true))
+            , '='), '+/', '-_');
+
+        Session::put(self::PASSPORT_SESSION_STATE, $state);
+        Session::put(self::PASSPORT_SESSION_CODE_VERIFIER, $codeVerifier);
 
         return sprintf(static::getHttpProcol() . self::URL_AUTHORIZE,
             ENV('PASSPORT_HOST'),
@@ -34,6 +44,8 @@ class OAuth2ClientService
                 'redirect_url' => ENV('PASSPORT_REDIRECT_URL'),
                 'response_type' => 'code',
                 'state' => $state,
+                'code_challenge' => $codeChallenge,
+                'code_challenge_method' => 'S256',
             ])
         );
     }
@@ -44,7 +56,7 @@ class OAuth2ClientService
      *
      * @return String
      */
-    public static function getLogoutUrl():String {
+    public static function redirectToLogoutProvider():String {
         return sprintf(static::getHttpProcol() . self::URL_LOGOUT,
             ENV('PASSPORT_HOST'),
             http_build_query([
@@ -62,10 +74,19 @@ class OAuth2ClientService
      */
     public static function handleLoginProviderCallback() {
         try {
-            $code = \request()->input('code');
+            $codeVerifierSession = Session::get(self::PASSPORT_SESSION_CODE_VERIFIER);
+            $stateSession = Session::get(self::PASSPORT_SESSION_STATE);
+            $code  = \request()->input('code');
+            $state = \request()->input('state');
+
+            if(empty($codeVerifierSession))
+                throw new \Exception('Código de verificação não encontrado.');
 
             if(empty($code))
                 throw new \Exception('Código de autorização não informado.');
+
+            if(empty($state) OR empty($stateSession) OR $state != $stateSession)
+                throw new \Exception('Não foi possível validar o estado.');
 
             $tokenUrl = sprintf(static::getHttpProcol() . self::URL_TOKEN, ENV('PASSPORT_HOST'));
 
@@ -75,8 +96,10 @@ class OAuth2ClientService
                     'client_id' => ENV('PASSPORT_CLIENT_ID'),
                     'client_secret' => ENV('PASSPORT_CLIENT_SECRET'),
                     'redirect_url' => ENV('PASSPORT_REDIRECT_URI'),
+                    'code_verifier' => $codeVerifierSession,
                     'code' => $code
                 ])->object();
+
 
                 if(isset($response->error))
                     throw new \Exception($result->error_description??'Erro desconhecido.');
@@ -84,7 +107,7 @@ class OAuth2ClientService
                 if(!isset($response->access_token) OR !isset($response->refresh_token))
                     throw new \Exception('Token de acesso não encontrada.');
 
-                $getUser = self::getUserInfo($response->access_token);
+                $getUser = self::getUser($response->access_token);
 
                 if(!$getUser)
                     throw new \Exception('Usuário não encontrado.');
@@ -98,7 +121,7 @@ class OAuth2ClientService
 
             return false;
         } catch(\Exception $e) {
-            return false;
+            throw new \Exception($e->getMessage());
         }
     }
 
@@ -109,7 +132,7 @@ class OAuth2ClientService
      * @param null $accessToken
      * @return mixed
      */
-    private static function c($accessToken=null) {
+    private static function getUser($accessToken=null) {
         try {
             if(empty($accessToken))
                 throw new \Exception('Token de acesso não informado.');
