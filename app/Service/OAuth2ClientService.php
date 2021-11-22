@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Http\Requests\Request;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Session;
@@ -17,39 +18,41 @@ class OAuth2ClientService
     const URL_LOGOUT    = '%s://%s/oauth/logout?%s';
     const URL_TOKEN     = '%s://%s/oauth/token';
     const URL_USER_INFO = '%s://%s/api/user';
-    const PASSPORT_SESSION_STATE = '_passport_state';
-    const PASSPORT_SESSION_CODE_VERIFIER = '_passport_code_verifier';
+    const SESSION_CODE_STATE = 'oauth2_state';
+    const SESSION_CHALLENGE_PUBLIC = 'oauth2_code_public';
+    const SESSION_CHALLENGE_PRIVATE = 'oauth2_code_private';
+    const CODE_CHALLENGE_METHOD = 'S256';
 
     /**
-     * redirectToLoginProvider
+     * getLoginUrl
      * Retorna a URL de login do Autorizador
      *
      * @return String
      */
-    public static function redirectToLoginProvider():String {
+    public static function getLoginUrl():String {
         return sprintf(self::URL_AUTHORIZE,
-            static::getHttpProcol(),
+            self::getHttpProcol(),
             ENV('PASSPORT_HOST'),
             http_build_query([
                 'client_id' => ENV('PASSPORT_CLIENT_ID'),
                 'redirect_url' => ENV('PASSPORT_REDIRECT_URL'),
                 'response_type' => 'code',
-                'state' => self::codeState(),
-                'code_challenge' => self::codeChallenge(),
-                'code_challenge_method' => 'S256',
+                'state' => self::codeStateGenerator(),
+                'code_challenge' => self::codeChallengeGenerator(),
+                'code_challenge_method' => self::CODE_CHALLENGE_METHOD,
             ])
         );
     }
 
     /**
-     * redirectToLogoutProvider
+     * getLogoutUrl
      * Retorna a URL de logout do Autorizador
      *
      * @return String
      */
-    public static function redirectToLogoutProvider():String {
+    public static function getLogoutUrl():String {
         return sprintf(self::URL_LOGOUT,
-            static::getHttpProcol(),
+            self::getHttpProcol(),
             ENV('PASSPORT_HOST'),
             http_build_query([
                 'client_id' => ENV('PASSPORT_CLIENT_ID'),
@@ -66,22 +69,13 @@ class OAuth2ClientService
      */
     public static function handleLoginProviderCallback() {
         try {
-            $codeVerifierSession = Session::get(self::PASSPORT_SESSION_CODE_VERIFIER);
-            $stateSession = Session::get(self::PASSPORT_SESSION_STATE);
-            $code  = \request()->input('code');
-            $state = \request()->input('state');
+            $code  = request()->input('code') ?? null;
+            $state = request()->input('state') ?? null;
 
-            if(empty($codeVerifierSession))
-                throw new \Exception('Código de verificação não encontrado.');
-
-            if(empty($code))
-                throw new \Exception('Código de autorização não informado.');
-
-            if(empty($state) OR empty($stateSession) OR $state != $stateSession)
-                throw new \Exception('Não foi possível validar o estado.');
+            self::validateCodeState($state);
 
             $tokenUrl = sprintf(self::URL_TOKEN,
-                static::getHttpProcol(),
+                self::getHttpProcol(),
                 ENV('PASSPORT_HOST'));
 
             try {
@@ -90,10 +84,9 @@ class OAuth2ClientService
                     'client_id' => ENV('PASSPORT_CLIENT_ID'),
                     'client_secret' => ENV('PASSPORT_CLIENT_SECRET'),
                     'redirect_url' => ENV('PASSPORT_REDIRECT_URI'),
-                    'code_verifier' => $codeVerifierSession,
+                    'code_verifier' => Session::get(self::SESSION_CHALLENGE_PRIVATE),
                     'code' => $code
                 ])->object();
-
 
                 if(isset($response->error))
                     throw new \Exception($result->error_description??'Erro desconhecido.');
@@ -132,7 +125,7 @@ class OAuth2ClientService
                 throw new \Exception('Token de acesso não informado.');
 
             $getUserInfoUrl = sprintf(self::URL_USER_INFO,
-                static::getHttpProcol(),
+                self::getHttpProcol(),
                 ENV('PASSPORT_HOST'));
 
             try {
@@ -169,14 +162,15 @@ class OAuth2ClientService
      * codeChallenge
      * @return String
      */
-    protected static function codeChallenge():String {
+    private static function codeChallengeGenerator():String {
         $codeVerifier = Str::random(128);
 
         $codeChallenge = strtr(rtrim(
             base64_encode(hash('sha256', $codeVerifier, true))
             , '='), '+/', '-_');
 
-        Session::put(self::PASSPORT_SESSION_STATE, $codeVerifier);
+        Session::put(self::SESSION_CHALLENGE_PRIVATE, $codeVerifier);
+        Session::put(self::SESSION_CHALLENGE_PUBLIC, $codeChallenge);
 
         return $codeChallenge;
     }
@@ -185,11 +179,98 @@ class OAuth2ClientService
      * codeState
      * @return String
      */
-    protected static function codeState():String {
-        $state = Str::random(256);
+    private static function codeStateGenerator():String {
+        $state = sprintf('%s.%s',
+            Str::random(256),
+            /**
+             * É necessário passar a Session ID junto ao Code State, pois quando
+             * recebemos uma redirect 302 de uma aplicação externa, se inicia uma nova sessão.
+             * Esta sessão será recuperada na self::sessionRegenerate
+             */
+            self::getSessionIdCrypted()
+        );
 
-        Session::put(self::PASSPORT_SESSION_STATE, $state);
+        Session::put(self::SESSION_CODE_STATE, $state);
 
         return $state;
+    }
+
+    /**
+     * getCurrentCodeSate
+     *
+     * @return String
+     */
+    public static function getCodeSate():String {
+        return Session::get(self::SESSION_CODE_STATE);
+    }
+
+    /**
+     * getCurrentChallengePublic
+     *
+     * @return String
+     */
+    public static function getChallengePublic():String {
+        return Session::get(self::SESSION_CHALLENGE_PUBLIC);
+    }
+
+    /**
+     * getSessionIdCrypted
+     * @return String
+     */
+    public static function getSessionIdCrypted():String {
+        return strtr(rtrim(
+            base64_encode(Crypt::encryptString(Session::getId()))
+            , '='), '+/', '-_');
+    }
+
+    /**
+     * validateCodeState
+     *
+     * @param $sessionId
+     * @return void
+     */
+    private static function validateCodeState($codeStateSessionId):void {
+        try {
+            if(empty($codeStateSessionId))
+                throw new \Exception('Code State não encontrado ou inválido.');
+
+            if(strpos($codeStateSessionId,'.') === false)
+                throw new \Exception('Formato do Code State inválido.');
+
+            [$codeState,$sessionIdCrypted] = explode('.',$codeStateSessionId);
+
+            $sessionId = Crypt::decryptString(base64_decode(strtr($sessionIdCrypted, '-_', '+/').'='));
+
+            self::sessionRegenarate($sessionId);
+
+            if($codeStateSessionId != Session::get(self::SESSION_CODE_STATE))
+                throw new \Exception('Code State inválido.');
+        } catch(\Exception $e){
+            throw new \Exception($e->getMessage());
+        }
+    }
+
+    /**
+     * sessionRegenarate
+     * Recuperando os dados da sessão perdidos devido ao redirect 302
+     *
+     * @param $sessionId
+     */
+    private static function sessionRegenarate($sessionId):void {
+        try {
+            Session::setId($sessionId);
+            Session::start();
+
+            $challengePrivate = Session::get(self::SESSION_CHALLENGE_PRIVATE);
+            $codeState = Session::get(self::SESSION_CODE_STATE);
+
+            if(empty($challengePrivate))
+                throw new \Exception('Code Challenge não encontrado ou inválido.');
+
+            if(empty($codeState))
+                throw new \Exception('Code State não enocntrado ou inválido.');
+        } catch(\Exception $e) {
+            throw new \Exception($e->getMessage());
+        }
     }
 }
