@@ -3,14 +3,15 @@
 namespace App\Services;
 
 use App\Http\Requests\Request;
+use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use Illuminate\Http\Client\RequestException;
 use Session;
 
 /**
- * Class OAuth2ClientService
- * @package App\Services
+ * OAuth2ClientService
  */
 class OAuth2ClientService
 {
@@ -21,6 +22,7 @@ class OAuth2ClientService
     const SESSION_CODE_STATE = 'oauth2_state';
     const SESSION_CHALLENGE_PUBLIC = 'oauth2_code_public';
     const SESSION_CHALLENGE_PRIVATE = 'oauth2_code_private';
+    const CODE_STATE_SEPARATOR = '.';
     const CODE_CHALLENGE_METHOD = 'S256';
 
     /**
@@ -44,9 +46,10 @@ class OAuth2ClientService
         );
     }
 
+
     /**
      * getLogoutUrl
-     * Retorna a URL de logout do Autorizador
+     * Retorna a URL de logout
      *
      * @return String
      */
@@ -61,13 +64,15 @@ class OAuth2ClientService
         );
     }
 
+
     /**
      * handleLoginProviderCallback
-     * Validação do código de autorização e solicitação de token de acesso
+     * Recebe o código de autorização e solicita a token de acesso
      *
-     * @return mixed
+     * @return object
+     * @throws \Exception
      */
-    public static function handleLoginProviderCallback() {
+    public static function handleLoginProviderCallback():Object {
         try {
             $code  = request()->input('code') ?? null;
             $state = request()->input('state') ?? null;
@@ -89,40 +94,34 @@ class OAuth2ClientService
                 ])->object();
 
                 if(isset($response->error))
-                    throw new \Exception($result->error_description??'Erro desconhecido.');
+                    throw new \RequestException($result->error_description??'Unknow error.');
 
                 if(!isset($response->access_token) OR !isset($response->refresh_token))
-                    throw new \Exception('Token de acesso não encontrada.');
+                    throw new \RequestException('Access Token not found.');
 
-                $getUser = self::getUser($response->access_token);
-
-                if(!$getUser)
-                    throw new \Exception('Usuário não encontrado.');
-
-                $response->getUser = $getUser;
+                $response->getUser = self::getUser($response->access_token);
 
                 return $response;
-            } catch (\Exception $e) {
-                throw new \Exception($e->getMessage());
+            } catch (RequestException $e) {
+                throw new \RequestException($e->getMessage());
             }
-
-            return false;
         } catch(\Exception $e) {
             throw new \Exception($e->getMessage());
         }
     }
 
+
     /**
      * getUser
-     * Recupera informações do usuário no autorizador
+     * Recupera info do user logado
      *
      * @param null $accessToken
-     * @return mixed
+     * @return false|object
      */
     private static function getUser($accessToken=null) {
         try {
             if(empty($accessToken))
-                throw new \Exception('Token de acesso não informado.');
+                throw new \Exception('Require Access Token: empty.');
 
             $getUserInfoUrl = sprintf(self::URL_USER_INFO,
                 self::getHttpProcol(),
@@ -135,16 +134,14 @@ class OAuth2ClientService
                 ])->get($getUserInfoUrl)->object();
 
                 if(!isset($response->id) OR !isset($response->email))
-                    throw new \Exception('Usuário não encontrado.');
+                    throw new \RequestException('User data not found.');
 
                 return $response;
-            } catch (\Exception $e) {
-                throw new \Exception($e->getMessage());
+            } catch (RequestException $e) {
+                throw new \RequestException($e->getMessage());
             }
-
-            return false;
         } catch(\Exception $e) {
-            return false;
+            throw new \Exception($e->getMessage());
         }
     }
 
@@ -159,7 +156,8 @@ class OAuth2ClientService
     }
 
     /**
-     * codeChallenge
+     * codeChallengeGenerator
+     *
      * @return String
      */
     private static function codeChallengeGenerator():String {
@@ -176,12 +174,14 @@ class OAuth2ClientService
     }
 
     /**
-     * codeState
+     * codeStateGenerator
+     *
      * @return String
      */
     private static function codeStateGenerator():String {
-        $state = sprintf('%s.%s',
+        $state = sprintf('%s%s%s',
             Str::random(256),
+            self::CODE_STATE_SEPARATOR,
             /**
              * É necessário passar a Session ID junto ao Code State, pois quando
              * recebemos uma redirect 302 de uma aplicação externa, se inicia uma nova sessão.
@@ -196,7 +196,7 @@ class OAuth2ClientService
     }
 
     /**
-     * getCurrentCodeSate
+     * getCodeSate
      *
      * @return String
      */
@@ -205,7 +205,7 @@ class OAuth2ClientService
     }
 
     /**
-     * getCurrentChallengePublic
+     * getChallengePublic
      *
      * @return String
      */
@@ -213,8 +213,10 @@ class OAuth2ClientService
         return Session::get(self::SESSION_CHALLENGE_PUBLIC);
     }
 
+
     /**
      * getSessionIdCrypted
+     *
      * @return String
      */
     public static function getSessionIdCrypted():String {
@@ -224,37 +226,58 @@ class OAuth2ClientService
     }
 
     /**
+     * getSessionIdDecrypted
+     *
+     * @param $sessionIdCrypted
+     * @return String
+     * @throws \Exception
+     */
+    public static function getSessionIdDecrypted($sessionIdCrypted):String {
+        try {
+            if(empty($sessionIdCrypted))
+                throw new \Exception('Code Challenge invalid or not found.');
+
+            return Crypt::decryptString(base64_decode(strtr($sessionIdCrypted, '-_', '+/').'='));
+        } catch(DecryptException $e) {
+            throw new DecryptException($e->getMessage());
+        }
+    }
+
+
+    /**
      * validateCodeState
      *
-     * @param $sessionId
-     * @return void
+     * @param $codeStateSessionId
+     * @throws \Exception
      */
     private static function validateCodeState($codeStateSessionId):void {
         try {
             if(empty($codeStateSessionId))
-                throw new \Exception('Code State não encontrado ou inválido.');
+                throw new \Exception('Code State invalid or not found.');
 
-            if(strpos($codeStateSessionId,'.') === false)
-                throw new \Exception('Formato do Code State inválido.');
+            if(strpos($codeStateSessionId, self::CODE_STATE_SEPARATOR) === false)
+                throw new \Exception('Code State format invalid.');
 
-            [$codeState,$sessionIdCrypted] = explode('.',$codeStateSessionId);
+            $sessionIdCrypted = rtrim(strstr($codeStateSessionId, self::CODE_STATE_SEPARATOR, false), self::CODE_STATE_SEPARATOR);
 
-            $sessionId = Crypt::decryptString(base64_decode(strtr($sessionIdCrypted, '-_', '+/').'='));
+            $sessionId = self::getSessionIdDecrypted($sessionIdCrypted);
 
             self::sessionRegenarate($sessionId);
 
             if($codeStateSessionId != Session::get(self::SESSION_CODE_STATE))
-                throw new \Exception('Code State inválido.');
+                throw new \Exception('Code State mismatch.');
         } catch(\Exception $e){
             throw new \Exception($e->getMessage());
         }
     }
 
+
     /**
      * sessionRegenarate
-     * Recuperando os dados da sessão perdidos devido ao redirect 302
+     * Recupera os dados da sessão perdidos devido ao redirect 302
      *
      * @param $sessionId
+     * @throws \Exception
      */
     private static function sessionRegenarate($sessionId):void {
         try {
@@ -265,10 +288,10 @@ class OAuth2ClientService
             $codeState = Session::get(self::SESSION_CODE_STATE);
 
             if(empty($challengePrivate))
-                throw new \Exception('Code Challenge não encontrado ou inválido.');
+                throw new \Exception('Code Challenge invalid or not found.');
 
             if(empty($codeState))
-                throw new \Exception('Code State não enocntrado ou inválido.');
+                throw new \Exception('Code State invalid or not found.');
         } catch(\Exception $e) {
             throw new \Exception($e->getMessage());
         }
