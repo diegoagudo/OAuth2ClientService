@@ -94,16 +94,16 @@ class OAuth2ClientService
                 ])->object();
 
                 if(isset($response->error))
-                    throw new \RequestException($result->error_description??'Unknow error.');
+                    throw new \Exception($response->error_description??'Unknow error.');
 
                 if(!isset($response->access_token) OR !isset($response->refresh_token))
-                    throw new \RequestException('Access Token not found.');
+                    throw new \Exception('Access Token not found.');
 
                 $response->getUser = self::getUser($response->access_token);
 
                 return $response;
             } catch (RequestException $e) {
-                throw new \RequestException($e->getMessage());
+                throw new RequestException($e->getMessage());
             }
         } catch(\Exception $e) {
             throw new \Exception($e->getMessage());
@@ -134,11 +134,11 @@ class OAuth2ClientService
                 ])->get($getUserInfoUrl)->object();
 
                 if(!isset($response->id) OR !isset($response->email))
-                    throw new \RequestException('User data not found.');
+                    throw new \Exception('User data not found.');
 
                 return $response;
             } catch (RequestException $e) {
-                throw new \RequestException($e->getMessage());
+                throw new RequestException($e->getMessage());
             }
         } catch(\Exception $e) {
             throw new \Exception($e->getMessage());
@@ -232,7 +232,7 @@ class OAuth2ClientService
      * @return String
      * @throws \Exception
      */
-    public static function getSessionIdDecrypted($sessionIdCrypted):String {
+    private static function getSessionIdDecrypted($sessionIdCrypted):String {
         try {
             if(empty($sessionIdCrypted))
                 throw new \Exception('Code Challenge invalid or not found.');
@@ -258,7 +258,7 @@ class OAuth2ClientService
             if(strpos($codeStateSessionId, self::CODE_STATE_SEPARATOR) === false)
                 throw new \Exception('Code State format invalid.');
 
-            $sessionIdCrypted = rtrim(strstr($codeStateSessionId, self::CODE_STATE_SEPARATOR, false), self::CODE_STATE_SEPARATOR);
+            $sessionIdCrypted = ltrim(strstr($codeStateSessionId, self::CODE_STATE_SEPARATOR, false), self::CODE_STATE_SEPARATOR);
 
             $sessionId = self::getSessionIdDecrypted($sessionIdCrypted);
 
